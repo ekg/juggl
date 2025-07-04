@@ -207,3 +207,64 @@ fn test_special_characters_in_content() {
     assert!(result.contains("test\ttab"));
     assert!(result.contains("end"));
 }
+
+#[test]
+fn test_seeded_shuffle_reproducible() {
+    let temp_dir = TempDir::new().unwrap();
+    let input_file = temp_dir.path().join("seeded.txt");
+    
+    let mut file = File::create(&input_file).unwrap();
+    write!(file, "1,2,3,4,5,6,7,8,9,10").unwrap();
+    
+    // Run with seed 42 twice
+    let output1 = Command::new("cargo")
+        .args(&["run", "--", &input_file.to_string_lossy(), "-d", ",", "-s", "42"])
+        .output()
+        .expect("Failed to execute command");
+    
+    let output2 = Command::new("cargo")
+        .args(&["run", "--", &input_file.to_string_lossy(), "-d", ",", "-s", "42"])
+        .output()
+        .expect("Failed to execute command");
+    
+    assert!(output1.status.success());
+    assert!(output2.status.success());
+    
+    // Both outputs should be identical
+    assert_eq!(output1.stdout, output2.stdout);
+}
+
+#[test]
+fn test_different_seeds_produce_different_outputs() {
+    let temp_dir = TempDir::new().unwrap();
+    let input_file = temp_dir.path().join("different_seeds.txt");
+    
+    let mut file = File::create(&input_file).unwrap();
+    write!(file, "a,b,c,d,e,f,g,h,i,j,k,l,m,n,o,p").unwrap();
+    
+    // Run with different seeds
+    let output1 = Command::new("cargo")
+        .args(&["run", "--", &input_file.to_string_lossy(), "-d", ",", "-s", "42"])
+        .output()
+        .expect("Failed to execute command");
+    
+    let output2 = Command::new("cargo")
+        .args(&["run", "--", &input_file.to_string_lossy(), "-d", ",", "-s", "123"])
+        .output()
+        .expect("Failed to execute command");
+    
+    assert!(output1.status.success());
+    assert!(output2.status.success());
+    
+    // Outputs should be different (with high probability)
+    assert_ne!(output1.stdout, output2.stdout);
+    
+    // But both should contain all the same elements
+    let result1 = String::from_utf8_lossy(&output1.stdout);
+    let result2 = String::from_utf8_lossy(&output2.stdout);
+    
+    for letter in ['a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j', 'k', 'l', 'm', 'n', 'o', 'p'] {
+        assert!(result1.contains(letter));
+        assert!(result2.contains(letter));
+    }
+}

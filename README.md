@@ -17,13 +17,14 @@ The binary will be available at `target/release/juggl`.
 ## Usage
 
 ```bash
-juggl <INPUT_FILE> -d <DELIMITER>
+juggl <INPUT_FILE> -d <DELIMITER> [OPTIONS]
 ```
 
 ### Arguments
 
 - `<INPUT_FILE>` - Path to the input file to shuffle
 - `-d, --delimiter <DELIMITER>` - Delimiter to split the file on
+- `-s, --seed <SEED>` - Random seed for reproducible shuffling (optional)
 
 ### Delimiter Formats
 
@@ -60,17 +61,31 @@ juggl records.dat -d "\x00" > shuffled_records.dat
 juggl data.txt -d "::" > shuffled.txt
 ```
 
+### Reproducible shuffle with seed
+```bash
+juggl data.csv -d "," -s 42 > shuffled.csv
+# Running with the same seed produces the same output
+juggl data.csv -d "," -s 42 > shuffled2.csv
+# shuffled.csv and shuffled2.csv will be identical
+```
+
 ## How It Works
 
 1. The file is memory-mapped for efficient reading
 2. The file is scanned for delimiter positions
-3. Chunks between delimiters are identified
-4. The chunks are randomly shuffled using a secure random number generator
-5. The shuffled chunks are written to stdout with delimiters preserved between them
+3. Chunk boundaries are stored as (start, end) position pairs in a vector
+4. The vector of boundaries is shuffled using the Fisher-Yates algorithm (via Rust's `shuffle()` method)
+5. The shuffled chunks are written to stdout by reading from the memory-mapped file in the new order
 
-## Performance
+## Performance and Memory Usage
 
-`juggl` uses memory-mapped I/O for efficient file reading, making it suitable for large files. The entire file is mapped into memory but only accessed as needed.
+`juggl` uses memory-mapped I/O for efficient file reading, making it suitable for large files. The memory requirements are:
+
+- **File content**: Memory-mapped (not loaded into RAM, paged in as needed by the OS)
+- **Chunk boundaries**: Small vector storing position pairs - requires ~16 bytes per chunk
+- **Shuffling**: In-place Fisher-Yates shuffle with O(n) time complexity
+
+For example, a 1GB file with 1 million chunks would only need ~16MB of RAM for the boundary data, while the file content remains memory-mapped.
 
 ## Testing
 

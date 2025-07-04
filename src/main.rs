@@ -1,6 +1,8 @@
 use clap::Parser;
 use memmap2::MmapOptions;
 use rand::seq::SliceRandom;
+use rand::SeedableRng;
+use rand::rngs::StdRng;
 use std::fs::File;
 use std::io::{self, Write};
 use std::path::PathBuf;
@@ -14,6 +16,9 @@ struct Args {
 
     #[arg(short, long, help = "Delimiter (supports escape sequences like \\x00)")]
     delimiter: String,
+
+    #[arg(short, long, help = "Random seed for reproducible shuffling")]
+    seed: Option<u64>,
 }
 
 fn parse_delimiter(delim: &str) -> Vec<u8> {
@@ -108,8 +113,13 @@ fn main() -> io::Result<()> {
         chunks.push((positions.last().copied().unwrap_or(0), mmap.len()));
     }
     
-    let mut rng = rand::thread_rng();
-    chunks.shuffle(&mut rng);
+    if let Some(seed) = args.seed {
+        let mut rng = StdRng::seed_from_u64(seed);
+        chunks.shuffle(&mut rng);
+    } else {
+        let mut rng = rand::rng();
+        chunks.shuffle(&mut rng);
+    }
     
     let stdout = io::stdout();
     let mut handle = stdout.lock();
