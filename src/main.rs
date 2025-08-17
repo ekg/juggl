@@ -3,9 +3,11 @@ use memmap2::MmapOptions;
 use rand::seq::SliceRandom;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
+use rayon::prelude::*;
 use std::fs::File;
 use std::io::{self, Write};
 use std::path::PathBuf;
+use std::sync::Arc;
 
 #[derive(Parser, Debug)]
 #[command(name = "juggl")]
@@ -19,6 +21,9 @@ struct Args {
 
     #[arg(short, long, help = "Random seed for reproducible shuffling")]
     seed: Option<u64>,
+
+    #[arg(short, long, help = "Number of threads for parallel processing (default: number of CPU cores)")]
+    threads: Option<usize>,
 }
 
 fn parse_delimiter(delim: &str) -> Vec<u8> {
@@ -75,27 +80,58 @@ fn parse_delimiter(delim: &str) -> Vec<u8> {
 }
 
 fn find_delimiter_positions(data: &[u8], delimiter: &[u8]) -> Vec<usize> {
-    let mut positions = vec![0];
-    
     if delimiter.is_empty() || data.len() < delimiter.len() {
-        return positions;
+        return vec![0];
     }
 
-    let mut i = 0;
-    while i <= data.len() - delimiter.len() {
-        if &data[i..i + delimiter.len()] == delimiter {
-            positions.push(i + delimiter.len());
-            i += delimiter.len();
-        } else {
-            i += 1;
-        }
+    let delimiter = Arc::new(delimiter.to_vec());
+    let data_len = data.len();
+    let delim_len = delimiter.len();
+    
+    let chunk_size = std::cmp::max(1_000_000, data_len / rayon::current_num_threads());
+    
+    let all_positions: Vec<Vec<usize>> = (0..data_len)
+        .into_par_iter()
+        .step_by(chunk_size)
+        .map(|start| {
+            let end = std::cmp::min(start + chunk_size + delim_len - 1, data_len);
+            let delimiter = delimiter.clone();
+            let mut local_positions = Vec::new();
+            
+            let mut i = start;
+            while i <= end.saturating_sub(delim_len) {
+                if &data[i..i + delim_len] == delimiter.as_slice() {
+                    local_positions.push(i + delim_len);
+                    i += delim_len;
+                } else {
+                    i += 1;
+                }
+            }
+            
+            local_positions
+        })
+        .collect();
+    
+    let mut positions = vec![0];
+    for chunk_positions in all_positions {
+        positions.extend(chunk_positions);
     }
-
+    
+    positions.sort_unstable();
+    positions.dedup();
+    
     positions
 }
 
 fn main() -> io::Result<()> {
     let args = Args::parse();
+    
+    if let Some(threads) = args.threads {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .build_global()
+            .expect("Failed to set thread count");
+    }
     
     let delimiter = parse_delimiter(&args.delimiter);
     
