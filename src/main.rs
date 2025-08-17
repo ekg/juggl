@@ -120,26 +120,21 @@ fn count_chunks_parallel(data: &[u8], delimiter: &[u8]) -> usize {
     chunk_count.load(Ordering::Relaxed)
 }
 
-fn find_chunk_at_index(data: &[u8], delimiter: &[u8], target_index: usize) -> Option<(usize, usize)> {
+fn build_chunk_index(data: &[u8], delimiter: &[u8]) -> Vec<(usize, usize)> {
+    let mut chunks = Vec::new();
+    
     if delimiter.is_empty() || data.is_empty() {
-        return if target_index == 0 {
-            Some((0, data.len()))
-        } else {
-            None
-        };
+        chunks.push((0, data.len()));
+        return chunks;
     }
 
     let delim_len = delimiter.len();
-    let mut chunk_index = 0;
     let mut chunk_start = 0;
     let mut i = 0;
 
     while i <= data.len().saturating_sub(delim_len) {
         if &data[i..i + delim_len] == delimiter {
-            if chunk_index == target_index {
-                return Some((chunk_start, i));
-            }
-            chunk_index += 1;
+            chunks.push((chunk_start, i));
             chunk_start = i + delim_len;
             i += delim_len;
         } else {
@@ -147,12 +142,12 @@ fn find_chunk_at_index(data: &[u8], delimiter: &[u8], target_index: usize) -> Op
         }
     }
 
-    // Check if we need to return the last chunk
-    if chunk_index == target_index && chunk_start < data.len() {
-        return Some((chunk_start, data.len()));
+    // Add the last chunk if there's remaining data
+    if chunk_start < data.len() {
+        chunks.push((chunk_start, data.len()));
     }
 
-    None
+    chunks
 }
 
 fn main() -> io::Result<()> {
@@ -177,6 +172,9 @@ fn main() -> io::Result<()> {
         return Ok(());
     }
     
+    // Pass 2: Build chunk index with a single scan
+    let chunk_index = build_chunk_index(&mmap, &delimiter);
+    
     // Generate permutation based on seed
     use hashed_permutation::HashedPermutation;
     let permutation = if let Some(seed) = args.seed {
@@ -184,7 +182,7 @@ fn main() -> io::Result<()> {
         let seed_u32 = (seed & 0xFFFFFFFF) as u32;
         HashedPermutation {
             seed: seed_u32,
-            length: NonZeroU32::new(total_chunks as u32).unwrap(),
+            length: NonZeroU32::new(chunk_index.len() as u32).unwrap(),
         }
     } else {
         // Random permutation
@@ -193,33 +191,31 @@ fn main() -> io::Result<()> {
         let random_seed: u32 = rng.random();
         HashedPermutation {
             seed: random_seed,
-            length: NonZeroU32::new(total_chunks as u32).unwrap(),
+            length: NonZeroU32::new(chunk_index.len() as u32).unwrap(),
         }
     };
     
-    // Pass 2: Stream chunks in permuted order
+    // Output chunks in permuted order
     let stdout = io::stdout();
     let mut handle = stdout.lock();
-    let mut first = true;
     
-    for i in 0..total_chunks {
+    for i in 0..chunk_index.len() {
         // Get the permuted index for position i
-        let chunk_index = match permutation.shuffle(i as u32) {
+        let permuted_idx = match permutation.shuffle(i as u32) {
             Ok(idx) => idx as usize,
-            Err(_) => continue, // Skip if out of bounds
+            Err(_) => continue,
         };
         
-        if let Some((start, end)) = find_chunk_at_index(&mmap, &delimiter, chunk_index) {
-            if start < end {
-                let chunk_data = &mmap[start..end];
-                
-                // Add delimiter before chunk if not the first one and chunk doesn't start with delimiter
-                if !first && !chunk_data.starts_with(&delimiter) && start > 0 {
-                    handle.write_all(&delimiter)?;
-                }
-                
-                handle.write_all(chunk_data)?;
-                first = false;
+        let (start, end) = chunk_index[permuted_idx];
+        if start < end {
+            let chunk_data = &mmap[start..end];
+            
+            // Write the chunk
+            handle.write_all(chunk_data)?;
+            
+            // Add delimiter after chunk if not the last one
+            if i < chunk_index.len() - 1 {
+                handle.write_all(&delimiter)?;
             }
         }
     }
@@ -294,24 +290,20 @@ mod tests {
     }
 
     #[test]
-    fn test_find_chunk_at_index() {
+    fn test_build_chunk_index() {
         let data = b"a,b,c,d";
         let delimiter = b",";
+        let index = build_chunk_index(data, delimiter);
         
-        assert_eq!(find_chunk_at_index(data, delimiter, 0), Some((0, 1)));
-        assert_eq!(find_chunk_at_index(data, delimiter, 1), Some((2, 3)));
-        assert_eq!(find_chunk_at_index(data, delimiter, 2), Some((4, 5)));
-        assert_eq!(find_chunk_at_index(data, delimiter, 3), Some((6, 7)));
-        assert_eq!(find_chunk_at_index(data, delimiter, 4), None);
+        assert_eq!(index, vec![(0, 1), (2, 3), (4, 5), (6, 7)]);
     }
 
     #[test]
-    fn test_find_chunk_at_index_with_consecutive_delimiters() {
+    fn test_build_chunk_index_with_consecutive_delimiters() {
         let data = b"a,,b";
         let delimiter = b",";
+        let index = build_chunk_index(data, delimiter);
         
-        assert_eq!(find_chunk_at_index(data, delimiter, 0), Some((0, 1)));
-        assert_eq!(find_chunk_at_index(data, delimiter, 1), Some((2, 2)));
-        assert_eq!(find_chunk_at_index(data, delimiter, 2), Some((3, 4)));
+        assert_eq!(index, vec![(0, 1), (2, 2), (3, 4)]);
     }
 }
