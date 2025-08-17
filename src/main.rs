@@ -1,5 +1,5 @@
 use clap::Parser;
-use memmap2::MmapOptions;
+use memmap2::{MmapOptions, MmapMut};
 use rayon::prelude::*;
 use std::fs::File;
 use std::io::{self, Write};
@@ -7,6 +7,7 @@ use std::num::NonZeroU32;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use tempfile::NamedTempFile;
 
 #[derive(Parser, Debug)]
 #[command(name = "juggl")]
@@ -120,31 +121,24 @@ fn count_chunks_parallel(data: &[u8], delimiter: &[u8]) -> usize {
     chunk_count.load(Ordering::Relaxed)
 }
 
-fn build_chunk_index(data: &[u8], delimiter: &[u8]) -> Vec<(usize, usize)> {
+fn build_chunk_index(data: &[u8], delimiter: &[u8]) -> Vec<usize> {
     let mut chunks = Vec::new();
+    chunks.push(0); // First chunk always starts at 0
     
     if delimiter.is_empty() || data.is_empty() {
-        chunks.push((0, data.len()));
         return chunks;
     }
 
     let delim_len = delimiter.len();
-    let mut chunk_start = 0;
     let mut i = 0;
 
     while i <= data.len().saturating_sub(delim_len) {
         if &data[i..i + delim_len] == delimiter {
-            chunks.push((chunk_start, i));
-            chunk_start = i + delim_len;
+            chunks.push(i + delim_len); // Start of next chunk
             i += delim_len;
         } else {
             i += 1;
         }
-    }
-
-    // Add the last chunk if there's remaining data
-    if chunk_start < data.len() {
-        chunks.push((chunk_start, data.len()));
     }
 
     chunks
@@ -172,41 +166,72 @@ fn main() -> io::Result<()> {
         return Ok(());
     }
     
-    // Pass 2: Build chunk index with a single scan
-    let chunk_index = build_chunk_index(&mmap, &delimiter);
+    // Pass 2: Build chunk index and write to temp file
+    let chunk_starts = build_chunk_index(&mmap, &delimiter);
+    let num_chunks = chunk_starts.len();
+    
+    // Create temp file for chunk index and memory map it
+    let temp_file = NamedTempFile::new()?;
+    let file_size = num_chunks * std::mem::size_of::<u64>();
+    temp_file.as_file().set_len(file_size as u64)?;
+    
+    {
+        let mut mmap_index = unsafe { MmapMut::map_mut(temp_file.as_file())? };
+        let index_slice = unsafe {
+            std::slice::from_raw_parts_mut(mmap_index.as_mut_ptr() as *mut u64, num_chunks)
+        };
+        
+        // Write chunk starts as u64 values
+        for (i, &start) in chunk_starts.iter().enumerate() {
+            index_slice[i] = start as u64;
+        }
+        
+        mmap_index.flush()?;
+    }
+    
+    // Now memory map the index file for reading
+    let index_mmap = unsafe { MmapOptions::new().map(temp_file.as_file())? };
+    let index_slice = unsafe {
+        std::slice::from_raw_parts(index_mmap.as_ptr() as *const u64, num_chunks)
+    };
     
     // Generate permutation based on seed
     use hashed_permutation::HashedPermutation;
     let permutation = if let Some(seed) = args.seed {
-        // Use the seed to create a deterministic permutation
         let seed_u32 = (seed & 0xFFFFFFFF) as u32;
         HashedPermutation {
             seed: seed_u32,
-            length: NonZeroU32::new(chunk_index.len() as u32).unwrap(),
+            length: NonZeroU32::new(num_chunks as u32).unwrap(),
         }
     } else {
-        // Random permutation
         use rand::Rng;
         let mut rng = rand::rng();
         let random_seed: u32 = rng.random();
         HashedPermutation {
             seed: random_seed,
-            length: NonZeroU32::new(chunk_index.len() as u32).unwrap(),
+            length: NonZeroU32::new(num_chunks as u32).unwrap(),
         }
     };
     
     // Output chunks in permuted order
     let stdout = io::stdout();
     let mut handle = stdout.lock();
+    let data_len = mmap.len();
     
-    for i in 0..chunk_index.len() {
+    for i in 0..num_chunks {
         // Get the permuted index for position i
         let permuted_idx = match permutation.shuffle(i as u32) {
             Ok(idx) => idx as usize,
             Err(_) => continue,
         };
         
-        let (start, end) = chunk_index[permuted_idx];
+        let start = index_slice[permuted_idx] as usize;
+        let end = if permuted_idx + 1 < num_chunks {
+            index_slice[permuted_idx + 1] as usize - delimiter.len()
+        } else {
+            data_len
+        };
+        
         if start < end {
             let chunk_data = &mmap[start..end];
             
@@ -214,7 +239,7 @@ fn main() -> io::Result<()> {
             handle.write_all(chunk_data)?;
             
             // Add delimiter after chunk if not the last one
-            if i < chunk_index.len() - 1 {
+            if i < num_chunks - 1 {
                 handle.write_all(&delimiter)?;
             }
         }
@@ -295,7 +320,7 @@ mod tests {
         let delimiter = b",";
         let index = build_chunk_index(data, delimiter);
         
-        assert_eq!(index, vec![(0, 1), (2, 3), (4, 5), (6, 7)]);
+        assert_eq!(index, vec![0, 2, 4, 6]);
     }
 
     #[test]
@@ -304,6 +329,6 @@ mod tests {
         let delimiter = b",";
         let index = build_chunk_index(data, delimiter);
         
-        assert_eq!(index, vec![(0, 1), (2, 2), (3, 4)]);
+        assert_eq!(index, vec![0, 2, 3]);
     }
 }
