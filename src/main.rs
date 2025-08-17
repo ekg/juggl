@@ -1,12 +1,11 @@
 use clap::Parser;
 use memmap2::MmapOptions;
-use rand::seq::SliceRandom;
-use rand::SeedableRng;
-use rand::rngs::StdRng;
 use rayon::prelude::*;
 use std::fs::File;
 use std::io::{self, Write};
+use std::num::NonZeroU32;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 #[derive(Parser, Debug)]
@@ -79,48 +78,81 @@ fn parse_delimiter(delim: &str) -> Vec<u8> {
     result
 }
 
-fn find_delimiter_positions(data: &[u8], delimiter: &[u8]) -> Vec<usize> {
-    if delimiter.is_empty() || data.len() < delimiter.len() {
-        return vec![0];
+fn count_chunks_parallel(data: &[u8], delimiter: &[u8]) -> usize {
+    if delimiter.is_empty() || data.is_empty() {
+        return 1;
     }
 
     let delimiter = Arc::new(delimiter.to_vec());
     let data_len = data.len();
     let delim_len = delimiter.len();
     
+    if data_len < delim_len {
+        return 1;
+    }
+    
+    let chunk_count = AtomicUsize::new(1); // Start with 1 for the initial chunk
     let chunk_size = std::cmp::max(1_000_000, data_len / rayon::current_num_threads());
     
-    let all_positions: Vec<Vec<usize>> = (0..data_len)
+    (0..data_len)
         .into_par_iter()
         .step_by(chunk_size)
-        .map(|start| {
+        .for_each(|start| {
             let end = std::cmp::min(start + chunk_size + delim_len - 1, data_len);
             let delimiter = delimiter.clone();
-            let mut local_positions = Vec::new();
+            let mut local_count = 0;
             
             let mut i = start;
             while i <= end.saturating_sub(delim_len) {
                 if &data[i..i + delim_len] == delimiter.as_slice() {
-                    local_positions.push(i + delim_len);
+                    local_count += 1;
                     i += delim_len;
                 } else {
                     i += 1;
                 }
             }
             
-            local_positions
-        })
-        .collect();
+            if local_count > 0 {
+                chunk_count.fetch_add(local_count, Ordering::Relaxed);
+            }
+        });
     
-    let mut positions = vec![0];
-    for chunk_positions in all_positions {
-        positions.extend(chunk_positions);
+    chunk_count.load(Ordering::Relaxed)
+}
+
+fn find_chunk_at_index(data: &[u8], delimiter: &[u8], target_index: usize) -> Option<(usize, usize)> {
+    if delimiter.is_empty() || data.is_empty() {
+        return if target_index == 0 {
+            Some((0, data.len()))
+        } else {
+            None
+        };
     }
-    
-    positions.sort_unstable();
-    positions.dedup();
-    
-    positions
+
+    let delim_len = delimiter.len();
+    let mut chunk_index = 0;
+    let mut chunk_start = 0;
+    let mut i = 0;
+
+    while i <= data.len().saturating_sub(delim_len) {
+        if &data[i..i + delim_len] == delimiter {
+            if chunk_index == target_index {
+                return Some((chunk_start, i));
+            }
+            chunk_index += 1;
+            chunk_start = i + delim_len;
+            i += delim_len;
+        } else {
+            i += 1;
+        }
+    }
+
+    // Check if we need to return the last chunk
+    if chunk_index == target_index && chunk_start < data.len() {
+        return Some((chunk_start, data.len()));
+    }
+
+    None
 }
 
 fn main() -> io::Result<()> {
@@ -138,40 +170,56 @@ fn main() -> io::Result<()> {
     let file = File::open(&args.input)?;
     let mmap = unsafe { MmapOptions::new().map(&file)? };
     
-    let positions = find_delimiter_positions(&mmap, &delimiter);
+    // Pass 1: Count chunks in parallel
+    let total_chunks = count_chunks_parallel(&mmap, &delimiter);
     
-    let mut chunks: Vec<(usize, usize)> = Vec::new();
-    for i in 0..positions.len() - 1 {
-        chunks.push((positions[i], positions[i + 1]));
+    if total_chunks == 0 {
+        return Ok(());
     }
     
-    if positions.last().copied().unwrap_or(0) < mmap.len() {
-        chunks.push((positions.last().copied().unwrap_or(0), mmap.len()));
-    }
-    
-    if let Some(seed) = args.seed {
-        let mut rng = StdRng::seed_from_u64(seed);
-        chunks.shuffle(&mut rng);
+    // Generate permutation based on seed
+    use hashed_permutation::HashedPermutation;
+    let permutation = if let Some(seed) = args.seed {
+        // Use the seed to create a deterministic permutation
+        let seed_u32 = (seed & 0xFFFFFFFF) as u32;
+        HashedPermutation {
+            seed: seed_u32,
+            length: NonZeroU32::new(total_chunks as u32).unwrap(),
+        }
     } else {
+        // Random permutation
+        use rand::Rng;
         let mut rng = rand::rng();
-        chunks.shuffle(&mut rng);
-    }
+        let random_seed: u32 = rng.random();
+        HashedPermutation {
+            seed: random_seed,
+            length: NonZeroU32::new(total_chunks as u32).unwrap(),
+        }
+    };
     
+    // Pass 2: Stream chunks in permuted order
     let stdout = io::stdout();
     let mut handle = stdout.lock();
+    let mut first = true;
     
-    for (i, &(start, end)) in chunks.iter().enumerate() {
-        if start < end {
-            let chunk_data = &mmap[start..end];
-            
-            if chunk_data.starts_with(&delimiter) {
-                handle.write_all(&chunk_data[delimiter.len()..])?;
-            } else {
+    for i in 0..total_chunks {
+        // Get the permuted index for position i
+        let chunk_index = match permutation.shuffle(i as u32) {
+            Ok(idx) => idx as usize,
+            Err(_) => continue, // Skip if out of bounds
+        };
+        
+        if let Some((start, end)) = find_chunk_at_index(&mmap, &delimiter, chunk_index) {
+            if start < end {
+                let chunk_data = &mmap[start..end];
+                
+                // Add delimiter before chunk if not the first one and chunk doesn't start with delimiter
+                if !first && !chunk_data.starts_with(&delimiter) && start > 0 {
+                    handle.write_all(&delimiter)?;
+                }
+                
                 handle.write_all(chunk_data)?;
-            }
-            
-            if i < chunks.len() - 1 && !chunk_data.ends_with(&delimiter) {
-                handle.write_all(&delimiter)?;
+                first = false;
             }
         }
     }
@@ -225,72 +273,45 @@ mod tests {
     }
 
     #[test]
-    fn test_find_delimiter_positions_empty_delimiter() {
-        let data = b"hello world";
-        let delimiter = b"";
-        assert_eq!(find_delimiter_positions(data, delimiter), vec![0]);
-    }
-
-    #[test]
-    fn test_find_delimiter_positions_single_char() {
+    fn test_count_chunks() {
         let data = b"a,b,c,d";
         let delimiter = b",";
-        assert_eq!(find_delimiter_positions(data, delimiter), vec![0, 2, 4, 6]);
+        assert_eq!(count_chunks_parallel(data, delimiter), 4);
     }
 
     #[test]
-    fn test_find_delimiter_positions_multi_char() {
-        let data = b"foo::bar::baz";
-        let delimiter = b"::";
-        assert_eq!(find_delimiter_positions(data, delimiter), vec![0, 5, 10]);
-    }
-
-    #[test]
-    fn test_find_delimiter_positions_no_match() {
-        let data = b"hello world";
-        let delimiter = b"xyz";
-        assert_eq!(find_delimiter_positions(data, delimiter), vec![0]);
-    }
-
-    #[test]
-    fn test_find_delimiter_positions_at_start() {
-        let data = b",a,b,c";
-        let delimiter = b",";
-        assert_eq!(find_delimiter_positions(data, delimiter), vec![0, 1, 3, 5]);
-    }
-
-    #[test]
-    fn test_find_delimiter_positions_at_end() {
-        let data = b"a,b,c,";
-        let delimiter = b",";
-        assert_eq!(find_delimiter_positions(data, delimiter), vec![0, 2, 4, 6]);
-    }
-
-    #[test]
-    fn test_find_delimiter_positions_consecutive() {
-        let data = b"a,,b";
-        let delimiter = b",";
-        assert_eq!(find_delimiter_positions(data, delimiter), vec![0, 2, 3]);
-    }
-
-    #[test]
-    fn test_find_delimiter_positions_empty_data() {
+    fn test_count_chunks_empty() {
         let data = b"";
         let delimiter = b",";
-        assert_eq!(find_delimiter_positions(data, delimiter), vec![0]);
+        assert_eq!(count_chunks_parallel(data, delimiter), 1);
     }
 
     #[test]
-    fn test_find_delimiter_positions_delimiter_longer_than_data() {
-        let data = b"ab";
-        let delimiter = b"abc";
-        assert_eq!(find_delimiter_positions(data, delimiter), vec![0]);
+    fn test_count_chunks_no_delimiter() {
+        let data = b"abcd";
+        let delimiter = b",";
+        assert_eq!(count_chunks_parallel(data, delimiter), 1);
     }
 
     #[test]
-    fn test_find_delimiter_positions_overlapping() {
-        let data = b"aaa";
-        let delimiter = b"aa";
-        assert_eq!(find_delimiter_positions(data, delimiter), vec![0, 2]);
+    fn test_find_chunk_at_index() {
+        let data = b"a,b,c,d";
+        let delimiter = b",";
+        
+        assert_eq!(find_chunk_at_index(data, delimiter, 0), Some((0, 1)));
+        assert_eq!(find_chunk_at_index(data, delimiter, 1), Some((2, 3)));
+        assert_eq!(find_chunk_at_index(data, delimiter, 2), Some((4, 5)));
+        assert_eq!(find_chunk_at_index(data, delimiter, 3), Some((6, 7)));
+        assert_eq!(find_chunk_at_index(data, delimiter, 4), None);
+    }
+
+    #[test]
+    fn test_find_chunk_at_index_with_consecutive_delimiters() {
+        let data = b"a,,b";
+        let delimiter = b",";
+        
+        assert_eq!(find_chunk_at_index(data, delimiter, 0), Some((0, 1)));
+        assert_eq!(find_chunk_at_index(data, delimiter, 1), Some((2, 2)));
+        assert_eq!(find_chunk_at_index(data, delimiter, 2), Some((3, 4)));
     }
 }
